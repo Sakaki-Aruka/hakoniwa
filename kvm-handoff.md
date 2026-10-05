@@ -127,6 +127,8 @@ ffmpeg -hide_banner -f v4l2 -input_format mjpeg -video_size 1280x720 -framerate 
 
 ### 運用 (2026-10-04 時点)
 
+> **2026-10-05: kvmcap は hakoniwa に改名した** (ソースは `cmd/hakoniwa/`、Nano 用の起動スクリプトは `contrib/licheerv-nano/S95hakoniwa`)。
+>
 > **2026-10-04 に Nano を素の状態に戻した。** kvmcap、S95kvmcap、`/boot/usb.host` を削除し、device モードに戻っている。以下は、再び載せ替えるときの手順として残す。ソースは `kvmcap/` にある。
 
 - バイナリは `/root/kvmcap/kvmcap`。起動スクリプトは `/etc/init.d/S95kvmcap` (start/stop/restart)。起動時に、1080p30 で `:8081` の配信を始める。ログは syslog (`/var/log/messages`。`/var/log` は `/tmp` へのリンクで、メモリ上)。

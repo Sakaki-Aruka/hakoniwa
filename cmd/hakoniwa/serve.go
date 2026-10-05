@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"log"
 	"log/syslog"
+	"net"
 	"os"
+	"os/exec"
 	"os/signal"
 	"runtime/debug"
 	"slices"
@@ -27,40 +29,72 @@ type Source interface {
 	Close()
 }
 
-func main() {
-	backend := flag.String("backend", "v4l2", "capture backend: v4l2, or usbfs (LicheeRV Nano workaround for slow uvcvideo)")
-	dev := flag.String("dev", "/dev/video0", "V4L2 device (v4l2 backend)")
-	usbDev := flag.String("usbdev", "/sys/bus/usb/devices/1-1", "sysfs path of the UVC device (usbfs backend)")
-	size := flag.String("size", "1920x1080", "resolution WxH (initial resolution in serve mode)")
-	sizes := flag.String("sizes", "1280x720,1920x1080", "serve mode: resolutions selectable from the web UI")
-	fps := flag.Int("fps", 30, "frame rate")
-	nbufs := flag.Int("bufs", 4, "number of V4L2 buffers (v4l2 backend)")
-	alt := flag.Int("alt", 0, "isochronous alternate setting, 0 = as requested by device (usbfs backend)")
-	nurbs := flag.Int("urbs", 8, "number of URBs in flight (usbfs backend)")
-	npkts := flag.Int("pkts", 32, "isochronous packets per URB (usbfs backend)")
-	dur := flag.Duration("t", 0, "test mode: capture duration (0 = serve HTTP forever)")
-	out := flag.String("o", "", "test mode: write raw MJPEG stream to this file")
-	listen := flag.String("listen", ":8081", "HTTP listen address (serve mode)")
-	memLimit := flag.Int("memlimit", 24, "Go soft memory limit in MiB")
-	audioDev := flag.String("audiodev", "hw:CARD=MS2109,DEV=0", "serve mode: ALSA capture device for HDMI audio (empty = disabled)")
-	hidPath := flag.String("hid", "", "serve mode: serial port of the ESP32 HID bridge (empty = no keyboard/mouse input)")
-	useSyslog := flag.Bool("syslog", false, "log to syslog instead of stderr")
-	spin := flag.Duration("spin", 0, "run the idle-CPU probe for this long and exit")
-	flag.Parse()
+// runServe runs one KVM session in the foreground (also used by "start",
+// which launches it in the background). It returns the exit code.
+func runServe(args []string) int {
+	fs := flag.NewFlagSet("serve", flag.ExitOnError)
+	backend := fs.String("backend", "v4l2", "capture backend: v4l2, or usbfs (LicheeRV Nano workaround for slow uvcvideo)")
+	dev := fs.String("dev", "/dev/video0", "V4L2 video device")
+	usbDev := fs.String("usbdev", "auto", "sysfs path of the UVC device for the usbfs backend (auto = derived from -dev)")
+	size := fs.String("size", "1920x1080", "initial resolution WxH")
+	sizes := fs.String("sizes", "1280x720,1920x1080", "resolutions selectable from the web UI")
+	fps := fs.Int("fps", 30, "frame rate")
+	nbufs := fs.Int("bufs", 4, "number of V4L2 buffers (v4l2 backend)")
+	alt := fs.Int("alt", 0, "isochronous alternate setting, 0 = as requested by device (usbfs backend)")
+	nurbs := fs.Int("urbs", 8, "number of URBs in flight (usbfs backend)")
+	npkts := fs.Int("pkts", 32, "isochronous packets per URB (usbfs backend)")
+	dur := fs.Duration("t", 0, "diagnostics: capture for this long, print statistics and exit (no HTTP)")
+	out := fs.String("o", "", "diagnostics: write the raw MJPEG stream to this file (with -t)")
+	listen := fs.String("listen", "127.0.0.1:8080", "HTTP listen address")
+	memLimit := fs.Int("memlimit", 24, "Go soft memory limit in MiB")
+	audioDev := fs.String("audiodev", "auto", "ALSA capture device for HDMI audio (auto = the sound card of the capture device, empty = disabled)")
+	hidPath := fs.String("hid", "", "serial port of the ESP32 HID bridge (empty = no keyboard/mouse input)")
+	useSyslog := fs.Bool("syslog", false, "log to syslog instead of stderr")
+	register := fs.Bool("register", true, "register the session so that \"hakoniwa list/close\" can see it")
+	spin := fs.Duration("spin", 0, "diagnostics: run the idle-CPU probe for this long and exit")
+	fs.Parse(args)
+	if fs.NArg() > 0 {
+		fmt.Fprintf(os.Stderr, "serve: unexpected argument %q\n", fs.Arg(0))
+		return 2
+	}
 	if *spin > 0 {
 		runSpin(*spin)
-		return
+		return 0
 	}
 	if *useSyslog {
-		w, err := syslog.New(syslog.LOG_INFO|syslog.LOG_DAEMON, "kvmcap")
+		w, err := syslog.New(syslog.LOG_INFO|syslog.LOG_DAEMON, "hakoniwa")
 		if err != nil {
-			log.Fatal(err)
+			log.Print(err)
+			return 1
 		}
 		log.SetOutput(w)
 		log.SetFlags(0)
 	}
 
 	debug.SetMemoryLimit(int64(*memLimit) << 20)
+
+	if *backend == "usbfs" && *usbDev == "auto" {
+		p, err := usbDeviceOf(*dev)
+		if err != nil {
+			log.Printf("serve: -usbdev auto: %v", err)
+			return 1
+		}
+		*usbDev = p
+	}
+	if *audioDev == "auto" {
+		*audioDev = audioDeviceOf(*dev)
+		if *audioDev == "" {
+			log.Printf("audio: no sound card found on the capture device; audio disabled")
+		}
+	}
+	if *audioDev != "" {
+		if _, err := exec.LookPath("arecord"); err != nil {
+			log.Printf("audio: arecord (alsa-utils) not found; audio disabled")
+			*audioDev = ""
+		} else {
+			log.Printf("audio: %s", *audioDev)
+		}
+	}
 
 	open := func(size string) (Source, error) {
 		var w, h int
@@ -91,28 +125,55 @@ func main() {
 	var stop atomic.Bool
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sig
-		stop.Store(true)
-	}()
 
 	if *dur == 0 {
 		allowed := strings.Split(*sizes, ",")
 		if !slices.Contains(allowed, *size) {
-			log.Fatalf("-size %s is not in -sizes %s", *size, *sizes)
+			log.Printf("serve: -size %s is not in -sizes %s", *size, *sizes)
+			return 2
 		}
-		os.Exit(runServer(open, *size, allowed, *audioDev, *hidPath, *listen, &stop))
+		ln, err := net.Listen("tcp", *listen)
+		if err != nil {
+			log.Printf("serve: %v", err)
+			return 1
+		}
+		if *register {
+			sess := &session{
+				PID:     os.Getpid(),
+				Port:    ln.Addr().(*net.TCPAddr).Port,
+				Listen:  ln.Addr().String(),
+				HID:     *hidPath,
+				Video:   *dev,
+				Started: time.Now(),
+			}
+			if err := sess.save(); err != nil {
+				log.Printf("serve: register session: %v", err)
+				ln.Close()
+				return 1
+			}
+			defer sess.remove()
+		}
+		go func() {
+			<-sig
+			stop.Store(true)
+		}()
+		return runServer(open, *size, allowed, *audioDev, *hidPath, ln, &stop)
 	}
 
+	go func() {
+		<-sig
+		stop.Store(true)
+	}()
 	log.Printf("mem before open: %s", memInfo())
 	src, err := open(*size)
 	if err != nil {
-		log.Fatal(err)
+		log.Print(err)
+		return 1
 	}
 	log.Printf("mem after open: %s", memInfo())
 	code := runTest(src, *dur, *out, &stop)
 	src.Close()
-	os.Exit(code)
+	return code
 }
 
 // runTest captures for dur and prints per-second statistics.

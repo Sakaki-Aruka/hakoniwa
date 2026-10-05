@@ -1,6 +1,6 @@
 # Build output
-kvmcap/kvmcap
-kvmcap/kvmcap-*
+/hakoniwa
+/dist/
 esp32-hid/.pio/
 
 # ESP-IDF component manager downloads (versions pinned by dependencies.lock)

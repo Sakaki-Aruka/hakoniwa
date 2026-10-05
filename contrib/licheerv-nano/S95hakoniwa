@@ -1,0 +1,33 @@
+#!/bin/sh
+# hakoniwa on the LicheeRV Nano (Buildroot, BusyBox init).
+# Install the riscv64 binary as /root/hakoniwa/hakoniwa and this script as
+# /etc/init.d/S95hakoniwa. The Nano needs the usbfs capture backend because
+# its in-kernel uvcvideo is too slow (see kvm-handoff.md).
+
+DAEMON=/root/hakoniwa/hakoniwa
+PIDFILE=/var/run/hakoniwa.pid
+ARGS="serve -syslog -backend usbfs -dev /dev/video0 -size 1280x720 -sizes 1280x720,1920x1080 -fps 30 -listen :8080 -register=false"
+
+case "$1" in
+start)
+	echo "Starting hakoniwa"
+	start-stop-daemon -S -b -m -p $PIDFILE -x $DAEMON -- $ARGS
+	;;
+stop)
+	echo "Stopping hakoniwa"
+	start-stop-daemon -K -p $PIDFILE -x $DAEMON -s TERM
+	# Wait for it to release the USB device and rebind uvcvideo.
+	for i in 1 2 3 4 5 6 7 8 9 10; do
+		[ -d /proc/$(cat $PIDFILE 2>/dev/null) ] || break
+		sleep 0.5
+	done
+	rm -f $PIDFILE
+	;;
+restart)
+	"$0" stop
+	"$0" start
+	;;
+*)
+	echo "Usage: $0 {start|stop|restart}"
+	exit 1
+esac

@@ -29,15 +29,32 @@ MIT ライセンス (`LICENSE`、Copyright (c) 2026 Sakaki-Aruka)。`esp32-hid/m
   - 同じ UART にブートローダのログも出る。ホストは既知のキーワードで始まる行だけを読む。
 - 注意: シリアルポートを開くと、ESP32 がリセットされることがある (CH343 の DTR/RTS とリセット回路のため)。ホストのプログラムはポートを開きっぱなしにする。
 
-## kvmcap (`kvmcap/`)
+## hakoniwa (`cmd/hakoniwa/`)
 
-起動 (この PC で試験中の例):
+旧名は kvmcap (2026-10-05 に改名し、サブコマンド形式にした)。Pure Go (cgo なし) で、64 ビット Linux 向けにクロスコンパイルできる。32 ビット環境では、コンパイルの時点でエラーにしている (V4L2 と usbfs の構造体が 64 ビット前提のため)。
 
 ```
-cd kvmcap && go build -o kvmcap-amd64 .
-./kvmcap-amd64 -dev /dev/v4l/by-id/usb-MACROSILICON_USB_Video-video-index0 -size 1920x1080 \
-  -hid /dev/serial/by-id/usb-1a86_USB_Single_Serial_5C94053883-if00 -listen 127.0.0.1:8081
+make build                 # ./hakoniwa (このマシン向け)
+make dist                  # dist/hakoniwa-linux-{amd64,arm64,riscv64}
+go install github.com/Sakaki-Aruka/hakoniwa/cmd/hakoniwa@latest
 ```
+
+コマンド:
+
+```
+hakoniwa start [options] <esp32-device> <video-device> [port]   # 既定のポートは 8080。バックグラウンドで起動
+hakoniwa close [port]                                           # 省略すると全セッションを停止
+hakoniwa list                                                   # セッション一覧
+hakoniwa serve [flags]                                          # 前面で起動 (start が内部で使う。Nano の起動スクリプトもこれを使う)
+```
+
+- 例: `hakoniwa start ttyACM0 video0`。デバイスは `/dev/` からの名前でも、フルパス (`/dev/serial/by-id/...` など) でもよい。
+- start のオプション: `--bind` (既定は 127.0.0.1。認証がないので、外に公開するときは注意)、`--size`、`--audio` (auto / none / ALSA のデバイス名)、`--backend` (v4l2 / usbfs)。オプションは、位置引数の前後どちらに書いてもよい。
+- start は、デバイスの存在、V4L2 デバイスかどうか、ほかのセッションとのポートやデバイスの重複を確認してから、`serve` をセッションから切り離して起動する。待ち受けを始めるまで待ち、失敗したらログの末尾を表示する。
+- セッションの登録は `$XDG_RUNTIME_DIR/hakoniwa/<port>.json` に置き、ログは `<port>.log` に出す。`serve` が待ち受けを始めた時点で登録し、終了時に消す。異常終了で残った登録は、`list` などを実行したときに片付ける。
+- close は SIGTERM を送り、5 秒たっても終わらなければ SIGKILL を送る。serve は終了時に、ESP32 に全キーと全ボタンを離す指示 (`KR`、`MB 0`) を送る。
+- 音声デバイスは、既定で、ビデオデバイスと同じ USB 機器にあるサウンドカードを sysfs から探して使う。`arecord` (alsa-utils) がなければ、音声を無効にする。
+- 確認済み (2026-10-05、実機): start、list、close (ポート指定と全停止)、同じデバイスや同じポートの拒否、存在しないデバイス、V4L2 でないデバイス、使用中のポート (ログの末尾を表示)、強制終了したセッションの片付け、オプションを後ろに書いたとき、音声デバイスの自動選択。
 
 - 映像: V4L2 (既定)。PC では標準の uvcvideo で十分速い。`/ws/video` (ack で流量を制御) と `/stream` (multipart)。
 - 音声: `/ws/audio` (arecord、PCM そのまま)。
@@ -51,7 +68,7 @@ cd kvmcap && go build -o kvmcap-amd64 .
     - USB メモリとして見せ、テキストファイルを置く。
     - 吸い出し専用の案: 映像の OCR、エージェント + raw HID。
 - 黒帯の補正: Windows のデスクトップが 16:10 などで、映像の上下左右に黒帯が入る場合に対応する。kvmcap は 2 秒ごとに映像から黒帯を検出し、`/api/status` の `area` で返す。ブラウザは、その範囲を基準に座標を計算する。黒帯と判定するのは、完全に黒く、左右 (上下) 対称で、デスクトップの端がはっきりしていて、同じ結果が 2 回続いたときだけ。暗い画面 (BIOS など) では、前回の結果を保つ。
-- 多言語対応: UI の文言は `kvmcap/locales/<言語コード>.json` に置く (キー → 文言。`_name` は言語メニューに出す名前)。バイナリに埋め込み、`/locales/<code>.json` と `/api/locales` (言語の一覧) で配信する。既定は英語で、ヘッダーの言語メニューで切り替え、選んだ言語はブラウザに保存する。HTML は `data-i18n` (本文) と `data-i18n-title` (ツールチップ) でキーを指し、動的な文言は JS の `t(key, {param})` で組み立てる。訳がないキーは英語で表示する。言語を足すときは JSON を 1 つ追加して再ビルドする。`go test` で、すべての言語が `en.json` と同じキーを持つこと、HTML が使うキーが `en.json` にあることを確かめる。サーバーが返すエラー文 (HID のエラーなど) は英語のまま。
+- 多言語対応: UI の文言は `cmd/hakoniwa/locales/<言語コード>.json` に置く (キー → 文言。`_name` は言語メニューに出す名前)。バイナリに埋め込み、`/locales/<code>.json` と `/api/locales` (言語の一覧) で配信する。既定は英語で、ヘッダーの言語メニューで切り替え、選んだ言語はブラウザに保存する。HTML は `data-i18n` (本文) と `data-i18n-title` (ツールチップ) でキーを指し、動的な文言は JS の `t(key, {param})` で組み立てる。訳がないキーは英語で表示する。言語を足すときは JSON を 1 つ追加して再ビルドする。`go test` で、すべての言語が `en.json` と同じキーを持つこと、HTML が使うキーが `en.json` にあることを確かめる。サーバーが返すエラー文 (HID のエラーなど) は英語のまま。
 - セキュリティ: `/ws/input` と `POST /api/size` は、Origin が一致しないリクエストを拒否する。認証はまだない。LAN に公開する前に、認証を入れる必要がある。
 
 ## 確認済み (2026-10-05)

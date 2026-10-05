@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"net"
 	"net/http"
 	"runtime"
 	"slices"
@@ -142,7 +143,7 @@ func (c *capturer) sleep(d time.Duration) {
 
 const boundary = "kvmframe"
 
-func runServer(open func(string) (Source, error), size string, sizes []string, audioDev, hidPath, addr string, stop *atomic.Bool) int {
+func runServer(open func(string) (Source, error), size string, sizes []string, audioDev, hidPath string, ln net.Listener, stop *atomic.Bool) int {
 	h := newHub()
 	c := &capturer{open: open, hub: h, stop: stop, want: size}
 	capDone := make(chan struct{})
@@ -285,7 +286,7 @@ func runServer(open func(string) (Source, error), size string, sizes []string, a
 		w.WriteHeader(http.StatusNoContent)
 	})
 
-	srv := &http.Server{Addr: addr, Handler: mux}
+	srv := &http.Server{Handler: mux}
 	go func() {
 		<-capDone
 		srv.Close()
@@ -301,14 +302,21 @@ func runServer(open func(string) (Source, error), size string, sizes []string, a
 		}
 	}()
 
-	log.Printf("serving on %s", addr)
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	log.Printf("serving on http://%s/", ln.Addr())
+	err := srv.Serve(ln)
+	stop.Store(true)
+	<-capDone
+	if hid != nil {
+		// WebSocket handlers are not closed by srv.Close, so make sure
+		// nothing stays pressed on the target when the session ends.
+		hid.send("KR")
+		hid.send("MB 0")
+	}
+	if err != nil && err != http.ErrServerClosed {
 		log.Print(err)
-		stop.Store(true)
-		<-capDone
 		return 1
 	}
-	<-capDone
+	log.Printf("session stopped")
 	return 0
 }
 
