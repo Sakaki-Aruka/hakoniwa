@@ -1,0 +1,7 @@
+# USB: keyboard, relative mouse, absolute mouse.
+CONFIG_TINYUSB_HID_COUNT=3
+# Keep UART0 (shared with the command channel) quiet.
+CONFIG_LOG_DEFAULT_LEVEL_WARN=y
+CONFIG_BOOTLOADER_LOG_LEVEL_WARN=y
+# Freenove ESP32-S3 WROOM: 8 MB flash
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y

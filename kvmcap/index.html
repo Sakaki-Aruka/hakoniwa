@@ -1,0 +1,478 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>KVM</title>
+<style>
+html,body{margin:0;height:100%;background:#111;color:#ddd;font:14px system-ui,sans-serif}
+body{display:flex;flex-direction:column}
+header{display:flex;gap:12px;align-items:center;padding:6px 12px;background:#222;flex-wrap:wrap}
+main{flex:1;min-height:0;display:flex;align-items:center;justify-content:center}
+canvas{max-width:100%;max-height:100%;object-fit:contain}
+body.fit canvas{width:100%;height:100%}
+.sep{width:1px;height:18px;background:#555}
+button{background:#333;color:#ddd;border:1px solid #555;border-radius:4px;padding:3px 10px;cursor:pointer}
+button.on{background:#2a6;border-color:#2a6;color:#fff}
+button:disabled{opacity:.4;cursor:default}
+#st{margin-left:auto;opacity:.7;white-space:pre;font-variant-numeric:tabular-nums}
+#vol{width:90px}
+select{background:#333;color:#ddd;border:1px solid #555;border-radius:4px;padding:2px 4px}
+canvas{outline:none;cursor:pointer}
+canvas.kb{cursor:default;box-shadow:0 0 0 2px #2a6}
+#mods{display:inline-flex;gap:4px}
+#kb{padding:2px 8px;border-radius:4px;background:#333}
+#kb.on{background:#2a6;color:#fff}
+.led{opacity:.35}.led.on{opacity:1;color:#6f6}
+</style></head><body>
+<header><span data-i18n="res.label">Resolution (30 fps):</span><span id="sizes"></span><span class="sep"></span>
+<button id="fit" data-i18n="fit" data-i18n-title="fit.title">Fit to window</button>
+<button id="fs" data-i18n="fullscreen" data-i18n-title="fullscreen.title">Fullscreen</button><span class="sep"></span>
+<button id="au" data-i18n="audio" data-i18n-title="audio.title">Audio</button>
+<input id="vol" type="range" min="0" max="1" step="0.05" value="1" data-i18n-title="volume.title"><span class="sep"></span>
+<span id="kb" data-i18n-title="control.title"></span>
+<button id="mmode" data-i18n-title="mouse.title"></button>
+<span id="mods" data-i18n-title="mods.title">
+<button data-u="224">Ctrl</button><button data-u="225">Shift</button><button data-u="226">Alt</button><button data-u="227">Win</button></span>
+<button id="win" data-i18n="win" data-i18n-title="win.title">Win tap</button>
+<button id="cad" data-i18n-title="cad.title">Ctrl+Alt+Del</button>
+<button id="rel" data-i18n="release" data-i18n-title="release.title">Release all keys</button>
+<span><span class="led" id="led-num">Num</span> <span class="led" id="led-caps">Caps</span> <span class="led" id="led-scroll">Scroll</span></span>
+<span id="st"></span>
+<select id="lang" data-i18n-title="lang.title"></select></header>
+<main><canvas id="v" width="1280" height="720" tabindex="0"></canvas></main>
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const sizesEl = $('sizes'), st = $('st'), cv = $('v'), g = cv.getContext('2d');
+const wsURL = path => (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + path;
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} },
+};
+
+// ---- i18n: translations live in /locales/<code>.json (see locales.go).
+// Static text uses data-i18n / data-i18n-title attributes; dynamic text uses
+// t(key, {param}). Missing keys fall back to English, then to the key.
+const i18n = {
+  lang: 'en', dict: {}, fallback: {}, listeners: [],
+  async load(code) { return (await fetch('/locales/' + encodeURIComponent(code) + '.json')).json(); },
+  async init() {
+    const sel = $('lang');
+    try {
+      const list = await (await fetch('/api/locales')).json();
+      for (const l of list) sel.append(new Option(l.name, l.code));
+      this.fallback = await this.load('en');
+      const saved = store.get('lang');
+      await this.set(list.some(l => l.code === saved) ? saved : 'en');
+    } catch (e) { this.apply(); }
+    sel.onchange = () => this.set(sel.value);
+  },
+  async set(code) {
+    this.dict = code === 'en' ? this.fallback : await this.load(code);
+    this.lang = code;
+    document.documentElement.lang = code;
+    $('lang').value = code;
+    store.set('lang', code);
+    this.apply();
+  },
+  apply() {
+    for (const el of document.querySelectorAll('[data-i18n]')) el.textContent = t(el.dataset.i18n);
+    for (const el of document.querySelectorAll('[data-i18n-title]')) el.title = t(el.dataset.i18nTitle);
+    for (const fn of this.listeners) fn();
+  },
+  onChange(fn) { this.listeners.push(fn); },
+};
+function t(key, params) {
+  let s = i18n.dict[key] ?? i18n.fallback[key] ?? key;
+  if (params) s = s.replace(/\{(\w+)\}/g, (m, k) => (k in params ? params[k] : m));
+  return s;
+}
+
+// ---- Video: JPEG frames over WebSocket, acked after drawing so at most two
+// frames are ever queued between the server and the screen.
+const video = {
+  ws: null, offset: null, samples: [], lastTs: 0,
+  age: 0, drawn: 0,
+  connect() {
+    const ws = new WebSocket(wsURL('/ws/video'));
+    ws.binaryType = 'arraybuffer';
+    ws.onopen = () => this.ping();
+    ws.onmessage = e => {
+      if (typeof e.data === 'string') {
+        const m = JSON.parse(e.data);
+        if (m.t === 'pong') this.pong(m);
+        return;
+      }
+      this.frame(e.data);
+    };
+    ws.onclose = () => { if (this.ws === ws) { this.ws = null; setTimeout(() => this.connect(), 1000); } };
+    this.ws = ws;
+  },
+  send(m) { if (this.ws && this.ws.readyState === 1) this.ws.send(JSON.stringify(m)); },
+  ping() { this.send({t: 'ping', c: performance.now()}); },
+  // Clock sync: server time ≈ performance.now() + offset, taken from the
+  // recent sample with the smallest round trip.
+  pong(m) {
+    const now = performance.now(), rtt = now - m.c;
+    this.samples.push({rtt, offset: m.s - (m.c + rtt / 2)});
+    if (this.samples.length > 15) this.samples.shift();
+    this.offset = this.samples.reduce((a, b) => b.rtt < a.rtt ? b : a).offset;
+  },
+  frame(buf) {
+    const ts = new DataView(buf).getFloat64(0, true);
+    createImageBitmap(new Blob([new Uint8Array(buf, 8)], {type: 'image/jpeg'})).then(bm => {
+      if (ts > this.lastTs) {
+        this.lastTs = ts;
+        if (cv.width !== bm.width || cv.height !== bm.height) { cv.width = bm.width; cv.height = bm.height; }
+        g.drawImage(bm, 0, 0);
+        this.drawn++;
+        if (this.offset !== null) {
+          const a = performance.now() + this.offset - ts;
+          this.age = this.age ? this.age * 0.9 + a * 0.1 : a;
+        }
+      }
+      bm.close();
+      this.send({t: 'ack'});
+    }, () => this.send({t: 'ack'}));
+  },
+};
+video.connect();
+setInterval(() => video.ping(), 2000);
+
+// ---- Audio: raw S16LE PCM over WebSocket, scheduled as consecutive
+// AudioBufferSourceNodes (AudioWorklet needs a secure context; this page is
+// served over plain http).
+const auBtn = $('au'), volEl = $('vol');
+const audio = {
+  on: false, ctx: null, gain: null, ws: null, next: 0, highSince: 0, rate: 48000, channels: 2,
+  TARGET: 0.06,  // buffering at start and after an underrun (s)
+  SLACK: 0.04,   // queued audio above TARGET+SLACK for 1 s gets trimmed
+  MAX: 0.20,     // never queue more than this (s)
+  start() {
+    this.on = true;
+    auBtn.classList.add('on');
+    if (!this.ctx) {
+      this.ctx = new (window.AudioContext || window.webkitAudioContext)({sampleRate: 48000, latencyHint: 'interactive'});
+      this.gain = this.ctx.createGain();
+      this.gain.connect(this.ctx.destination);
+    }
+    this.gain.gain.value = +volEl.value;
+    this.ctx.resume();
+    this.next = 0;
+    this.connect();
+  },
+  connect() {
+    const ws = new WebSocket(wsURL('/ws/audio'));
+    ws.binaryType = 'arraybuffer';
+    ws.onmessage = e => {
+      if (typeof e.data === 'string') {
+        const m = JSON.parse(e.data);
+        if (m.type === 'format') { this.rate = m.rate; this.channels = m.channels; }
+        return;
+      }
+      this.play(e.data);
+    };
+    ws.onclose = () => { if (this.on && this.ws === ws) setTimeout(() => { if (this.on && this.ws === ws) this.connect(); }, 1000); };
+    this.ws = ws;
+  },
+  stop() {
+    this.on = false;
+    auBtn.classList.remove('on');
+    const ws = this.ws; this.ws = null;
+    if (ws) ws.close();
+    if (this.ctx) this.ctx.suspend();
+  },
+  play(buf) {
+    const ctx = this.ctx, now = ctx.currentTime, q = this.next - now;
+    if (q < 0.005) {
+      this.next = now + this.TARGET;          // start or underrun: rebuffer
+    } else if (q > this.MAX) {
+      return;                                  // far behind: drop
+    } else if (q > this.TARGET + this.SLACK) {
+      // Persistently above target (clock drift or a burst after a stall):
+      // drop one chunk per second until back in range.
+      if (!this.highSince) this.highSince = now;
+      else if (now - this.highSince > 1) { this.highSince = 0; return; }
+    } else {
+      this.highSince = 0;
+    }
+    const ch = this.channels, s = new Int16Array(buf), n = s.length / ch;
+    const ab = ctx.createBuffer(ch, n, this.rate);
+    for (let c = 0; c < ch; c++) {
+      const d = ab.getChannelData(c);
+      for (let i = 0; i < n; i++) d[i] = s[i * ch + c] / 32768;
+    }
+    const src = ctx.createBufferSource();
+    src.buffer = ab;
+    src.connect(this.gain);
+    src.start(this.next);
+    this.next += ab.duration;
+  },
+  latencyMs() {
+    if (!this.ctx) return 0;
+    const out = this.ctx.outputLatency || this.ctx.baseLatency || 0;
+    return Math.max(0, Math.round((this.next - this.ctx.currentTime + out) * 1000));
+  },
+};
+auBtn.onclick = () => audio.on ? audio.stop() : audio.start();
+{ const v = store.get('vol'); if (v !== null) volEl.value = v; }
+volEl.oninput = () => {
+  if (audio.gain) audio.gain.gain.value = +volEl.value;
+  store.set('vol', volEl.value);
+};
+
+// ---- Keyboard: KeyboardEvent.code (physical position) → HID usage ID, sent
+// over /ws/input while the video has focus. Key repeat is left to the target.
+const HID = (() => {
+  const m = {
+    Enter: 0x28, Escape: 0x29, Backspace: 0x2a, Tab: 0x2b, Space: 0x2c, Minus: 0x2d, Equal: 0x2e,
+    BracketLeft: 0x2f, BracketRight: 0x30, Backslash: 0x31, Semicolon: 0x33, Quote: 0x34,
+    Backquote: 0x35, Comma: 0x36, Period: 0x37, Slash: 0x38, CapsLock: 0x39,
+    PrintScreen: 0x46, ScrollLock: 0x47, Pause: 0x48, Insert: 0x49, Home: 0x4a, PageUp: 0x4b,
+    Delete: 0x4c, End: 0x4d, PageDown: 0x4e, ArrowRight: 0x4f, ArrowLeft: 0x50, ArrowDown: 0x51,
+    ArrowUp: 0x52, NumLock: 0x53, NumpadDivide: 0x54, NumpadMultiply: 0x55, NumpadSubtract: 0x56,
+    NumpadAdd: 0x57, NumpadEnter: 0x58, Numpad0: 0x62, NumpadDecimal: 0x63, IntlBackslash: 0x64,
+    ContextMenu: 0x65, Power: 0x66, NumpadEqual: 0x67,
+    IntlRo: 0x87, KanaMode: 0x88, IntlYen: 0x89, Convert: 0x8a, NonConvert: 0x8b, Lang1: 0x90, Lang2: 0x91,
+    ControlLeft: 0xe0, ShiftLeft: 0xe1, AltLeft: 0xe2, MetaLeft: 0xe3,
+    ControlRight: 0xe4, ShiftRight: 0xe5, AltRight: 0xe6, MetaRight: 0xe7, OSLeft: 0xe3, OSRight: 0xe7,
+  };
+  for (let i = 0; i < 26; i++) m['Key' + String.fromCharCode(65 + i)] = 0x04 + i;
+  for (let i = 1; i <= 9; i++) { m['Digit' + i] = 0x1d + i; m['Numpad' + i] = 0x58 + i; }
+  m.Digit0 = 0x27;
+  for (let i = 1; i <= 12; i++) m['F' + i] = 0x39 + i;
+  for (let i = 13; i <= 24; i++) m['F' + i] = 0x68 + i - 13;
+  return m;
+})();
+// Some clients only report keydown for these (IME toggles); release them ourselves.
+const AUTO_RELEASE = new Set(['KanaMode', 'Lang1', 'Lang2']);
+
+const kbEl = $('kb');
+const input = {
+  ws: null, held: new Set(), status: null,
+  connect() {
+    const ws = new WebSocket(wsURL('/ws/input'));
+    ws.onmessage = e => {
+      const m = JSON.parse(e.data);
+      if (m.t === 'hid') { this.status = m; this.showLEDs(m.leds); }
+    };
+    ws.onclose = () => {
+      this.held.clear();
+      if (this.ws === ws) { this.ws = null; this.status = null; setTimeout(() => this.connect(), 1000); }
+    };
+    this.ws = ws;
+  },
+  send(m) { if (this.ws && this.ws.readyState === 1) this.ws.send(JSON.stringify(m)); },
+  down(u) { if (!this.held.has(u)) { this.held.add(u); this.send({t: 'kd', u}); } },
+  up(u) { if (this.held.delete(u)) this.send({t: 'ku', u}); },
+  releaseAll() { this.held.clear(); this.send({t: 'kr'}); },
+  showLEDs(v) {
+    $('led-num').classList.toggle('on', !!(v & 1));
+    $('led-caps').classList.toggle('on', !!(v & 2));
+    $('led-scroll').classList.toggle('on', !!(v & 4));
+  },
+};
+input.connect();
+
+// Latched modifiers (on-screen Ctrl/Shift/Alt/Win): pressed together with the
+// next non-modifier key, released with it. Lets clients send combos the
+// client OS would intercept (Win+R, Win+L, ...).
+const isModifier = u => u >= 0xe0 && u <= 0xe7;
+const latch = {
+  set: new Set(), active: null, // active: {key, mods} while a latched combo is down
+  toggle(u) { this.set.has(u) ? this.set.delete(u) : this.set.add(u); this.show(); },
+  clear() { this.set.clear(); this.show(); },
+  show() { for (const b of $('mods').children) b.classList.toggle('on', this.set.has(+b.dataset.u)); },
+  keyDown(u) {
+    if (isModifier(u) || !this.set.size || this.active) return;
+    const mods = [...this.set];
+    mods.forEach(m => input.down(m));
+    this.active = {key: u, mods};
+  },
+  keyUp(u) {
+    if (!this.active || this.active.key !== u) return;
+    this.active.mods.forEach(m => input.up(m));
+    this.active = null;
+    this.clear();
+  },
+};
+
+const capturing = () => document.activeElement === cv;
+function setCapture(on) {
+  cv.classList.toggle('kb', on);
+  kbEl.classList.toggle('on', on);
+  kbEl.textContent = on ? t('control.on') : t('control.off');
+}
+cv.addEventListener('focus', () => setCapture(true));
+cv.addEventListener('blur', () => { input.releaseAll(); latch.active = null; mouse.releaseButtons(); setCapture(false); });
+cv.addEventListener('keydown', e => {
+  const u = HID[e.code];
+  e.preventDefault();
+  e.stopPropagation();
+  if (u === undefined || e.repeat) return;
+  latch.keyDown(u);
+  input.down(u);
+  if (AUTO_RELEASE.has(e.code)) setTimeout(() => input.up(u), 50);
+});
+cv.addEventListener('keyup', e => {
+  const u = HID[e.code];
+  e.preventDefault();
+  e.stopPropagation();
+  if (u !== undefined) { input.up(u); latch.keyUp(u); }
+});
+// Switching windows (Alt+Tab etc.) can swallow keyup events.
+window.addEventListener('blur', () => input.releaseAll());
+document.addEventListener('visibilitychange', () => { if (document.hidden) input.releaseAll(); });
+
+$('rel').onclick = () => { input.releaseAll(); latch.active = null; latch.clear(); mouse.releaseButtons(); };
+// Keyboard buttons must not take focus away from the video (that would stop
+// keyboard capture and release keys).
+for (const id of ['mods', 'win', 'cad', 'rel']) $(id).addEventListener('mousedown', e => e.preventDefault());
+for (const b of $('mods').children) b.onclick = () => { latch.toggle(+b.dataset.u); cv.focus(); };
+$('win').onclick = () => {
+  input.down(0xe3);
+  setTimeout(() => input.up(0xe3), 60);
+  cv.focus();
+};
+$('cad').onclick = () => {
+  const keys = [0xe0, 0xe2, 0x4c]; // Ctrl, Alt, Delete
+  keys.forEach((u, i) => setTimeout(() => input.down(u), i * 30));
+  setTimeout(() => keys.slice().reverse().forEach((u, i) => setTimeout(() => input.up(u), i * 30)), 150);
+};
+
+// ---- Mouse. Absolute mode maps the pointer position on the video to
+// 0..32767 (the target follows exactly); relative mode uses Pointer Lock and
+// sends movement deltas (for BIOS/GRUB, which only know the boot mouse).
+// Moves are coalesced to one message per animation frame.
+const mouse = {
+  relative: false, buttons: 0, pending: null, rel: {x: 0, y: 0}, wheelAcc: 0, raf: 0,
+  area: {X: 0, Y: 0, W: 1, H: 1}, // target desktop inside the frame (server-detected black bars)
+  toAbs(e) {
+    // The canvas is letterboxed by object-fit: contain; find the frame on
+    // screen, then the target desktop inside the frame.
+    const r = cv.getBoundingClientRect();
+    const scale = Math.min(r.width / cv.width, r.height / cv.height);
+    const w = cv.width * scale, h = cv.height * scale;
+    const a = this.area;
+    const x = ((e.clientX - r.left - (r.width - w) / 2) / w - a.X) / a.W;
+    const y = ((e.clientY - r.top - (r.height - h) / 2) / h - a.Y) / a.H;
+    const c = v => Math.round(Math.min(1, Math.max(0, v)) * 32767);
+    return {x: c(x), y: c(y)};
+  },
+  schedule() { if (!this.raf) this.raf = requestAnimationFrame(() => { this.raf = 0; this.flush(); }); },
+  flush() {
+    if (this.pending) { input.send({t: 'ma', ...this.pending}); this.pending = null; }
+    if (this.rel.x || this.rel.y) { input.send({t: 'mr', x: this.rel.x, y: this.rel.y}); this.rel = {x: 0, y: 0}; }
+  },
+  setButtons(b) {
+    this.flush(); // the click must land where the pointer is now
+    if (b !== this.buttons) { this.buttons = b; input.send({t: 'mb', b}); }
+  },
+  releaseButtons() { if (this.buttons) this.setButtons(0); },
+  locked() { return document.pointerLockElement === cv; },
+};
+const mmodeBtn = $('mmode');
+function setMouseMode(rel) {
+  mouse.relative = rel;
+  mmodeBtn.textContent = rel ? t('mouse.rel') : t('mouse.abs');
+  mmodeBtn.classList.toggle('on', rel);
+  if (!rel && mouse.locked()) document.exitPointerLock();
+}
+mmodeBtn.addEventListener('mousedown', e => e.preventDefault());
+mmodeBtn.onclick = () => setMouseMode(!mouse.relative);
+
+cv.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  if (!capturing()) { cv.focus(); return; }  // first click only starts control
+  if (mouse.relative && !mouse.locked()) { cv.requestPointerLock(); return; }
+  if (!mouse.relative) { mouse.pending = mouse.toAbs(e); cv.setPointerCapture(e.pointerId); }
+  mouse.setButtons(e.buttons & 0x1f);
+});
+cv.addEventListener('pointerup', e => {
+  e.preventDefault();
+  if (!capturing()) return;
+  if (!mouse.relative) mouse.pending = mouse.toAbs(e);
+  mouse.setButtons(e.buttons & 0x1f);
+});
+cv.addEventListener('pointermove', e => {
+  if (!capturing()) return;
+  if (mouse.relative) {
+    if (!mouse.locked()) return;
+    mouse.rel.x += e.movementX; mouse.rel.y += e.movementY;
+  } else {
+    mouse.pending = mouse.toAbs(e);
+  }
+  mouse.schedule();
+  // Chorded button changes arrive as pointermove (pointerdown fires only for the first button).
+  if ((e.buttons & 0x1f) !== mouse.buttons && (mouse.buttons || e.buttons)) mouse.setButtons(e.buttons & 0x1f);
+});
+cv.addEventListener('wheel', e => {
+  e.preventDefault();
+  if (!capturing()) return;
+  // One notch ≈ 100 px (deltaMode 0) or 3 lines (deltaMode 1).
+  mouse.wheelAcc += e.deltaMode === 1 ? e.deltaY / 3 : e.deltaMode === 2 ? e.deltaY : e.deltaY / 100;
+  const n = Math.trunc(mouse.wheelAcc);
+  if (n) { mouse.wheelAcc -= n; mouse.flush(); input.send({t: 'mw', d: -n}); }
+}, {passive: false});
+cv.addEventListener('contextmenu', e => e.preventDefault());
+// Back/forward buttons would navigate the page.
+cv.addEventListener('mouseup', e => { if (e.button === 3 || e.button === 4) e.preventDefault(); });
+document.addEventListener('pointerlockchange', () => {
+  if (!mouse.locked()) mouse.releaseButtons();
+});
+
+// ---- View controls
+const fitBtn = $('fit');
+function setFit(on) {
+  document.body.classList.toggle('fit', on);
+  fitBtn.classList.toggle('on', on);
+  store.set('fit', on ? '1' : '0');
+}
+fitBtn.onclick = () => setFit(!document.body.classList.contains('fit'));
+setFit(store.get('fit') === '1');
+$('fs').onclick = async () => {
+  if (document.fullscreenElement) return document.exitFullscreen();
+  await document.documentElement.requestFullscreen();
+  // In fullscreen, Keyboard Lock lets Esc/Win/Alt+Tab reach the target
+  // (Chrome; secure contexts such as localhost only). Hold Esc to exit.
+  if (navigator.keyboard && navigator.keyboard.lock) navigator.keyboard.lock().catch(() => {});
+  cv.focus();
+};
+
+// ---- Status
+let lastDrawn = 0, lastT = performance.now();
+async function refresh() {
+  const now = performance.now();
+  const fps = (video.drawn - lastDrawn) * 1000 / (now - lastT);
+  lastDrawn = video.drawn; lastT = now;
+  try {
+    const s = await (await fetch('/api/status')).json();
+    if (s.area) mouse.area = s.area;
+    if (!sizesEl.childElementCount) {
+      for (const z of s.sizes) {
+        const b = document.createElement('button');
+        b.textContent = z.split('x')[1] + 'p';
+        b.dataset.size = z;
+        b.onclick = () => fetch('/api/size', {method: 'POST', body: new URLSearchParams({size: z})}).then(refresh);
+        sizesEl.append(b);
+      }
+    }
+    for (const b of sizesEl.children) b.classList.toggle('on', b.dataset.size === s.size);
+    const parts = [s.error ? t('status.error', {msg: s.error})
+      : !s.active ? t('status.switching')
+      : t('status.video', {size: s.active, fps: fps.toFixed(1), drops: s.drops, ms: Math.round(video.age)})];
+    const h = input.status;
+    const hid = !h ? t('hid.disconnected')
+      : !h.connected ? t('hid.error') + (h.error ? ': ' + h.error : '')
+      : !h.mounted ? t('hid.no_usb') : t('hid.ok');
+    parts.push(t('status.hid', {state: hid}));
+    if (!s.audio) auBtn.disabled = true;
+    else if (audio.on) parts.push(s.audio.error ? t('status.audio_error', {msg: s.audio.error}) : t('status.audio', {ms: audio.latencyMs()}));
+    st.textContent = parts.join('  ');
+  } catch (e) { st.textContent = t('status.offline'); }
+}
+setCapture(capturing());
+setMouseMode(mouse.relative);
+i18n.onChange(() => { setCapture(capturing()); setMouseMode(mouse.relative); refresh(); });
+i18n.init();
+refresh(); setInterval(refresh, 2000);
+</script>
+</body></html>
